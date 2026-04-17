@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wickens MRT — Cockpit Dual-Task Experiment</title>
+<link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #080C12; overflow-x: hidden; }
+  button:active { transform: scale(0.97); }
+  button:focus { outline: none; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+const DURATION = 25000;
+const W = 1000, H = 700;
+const STICK_GAIN = 0.04;
+const DEADZONE = 15;
+const ALERT_INTERVAL_MIN = 3200;
+const ALERT_INTERVAL_MAX = 5500;
+const ALERT_WINDOW = 3000;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ─── Audio ───
+let _ac = null;
+const ac = () => { if (!_ac) _ac = new (window.AudioContext || window.webkitAudioContext)(); if (_ac.state === "suspended") _ac.resume(); return _ac; };
+const buzz = (dur, pan) => {
+  const c = ac(), o = c.createOscillator(), g = c.createGain(), p = c.createStereoPanner();
+  o.frequency.value = 340; o.type = "sawtooth";
+  g.gain.setValueAtTime(0.22, c.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+  p.pan.value = pan;
+  o.connect(g).connect(p).connect(c.destination); o.start(); o.stop(c.currentTime + dur);
+};
+const playAlarmPanned = (pan) => {
+  buzz(0.12, pan);
+  setTimeout(() => buzz(0.12, pan), 180);
+  setTimeout(() => buzz(0.12, pan), 360);
+};
+const say = (text) => { const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; u.pitch = 1; speechSynthesis.speak(u); };
+
+// ─── Styles ───
+const font = "'Oxanium',monospace";
+const btnStyle = (color = "#5EEAD4") => ({
+  fontFamily: font, fontSize: 14, fontWeight: 600, letterSpacing: "0.1em",
+  background: "transparent", color, border: `1px solid ${color}44`,
+  borderRadius: 6, padding: "12px 36px", cursor: "pointer", textTransform: "uppercase", transition: "all 0.15s",
+});
+
+// ─── Conditions ───
+const CONDITIONS = [
+  { id: "vis-spa", label: "Visual–Spatial", color: "#F97353", secondary: "visual-spatial" },
+  { id: "vis-ver", label: "Visual–Verbal", color: "#8B7CF6", secondary: "visual-verbal" },
+  { id: "aud-ver", label: "Auditory–Verbal", color: "#FBBF24", secondary: "auditory-verbal" },
+  { id: "aud-spa", label: "Auditory–Spatial", color: "#F472B6", secondary: "auditory-spatial" },
+];
+
+// ─── Scene Drawing ───
+function drawSky(ctx, pitch) {
+  const hy = H/2+pitch*4;
+  const sg = ctx.createLinearGradient(0,Math.min(hy-300,0),0,Math.max(hy,0));
+  sg.addColorStop(0,"#0A1628"); sg.addColorStop(0.4,"#14304A"); sg.addColorStop(0.7,"#2A5A6E"); sg.addColorStop(1,"#4A8A9A");
+  ctx.fillStyle = sg; ctx.fillRect(0,0,W,Math.max(0,hy));
+  const gg = ctx.createLinearGradient(0,Math.max(hy,0),0,H);
+  gg.addColorStop(0,"#3A6644"); gg.addColorStop(0.3,"#2D5235"); gg.addColorStop(0.7,"#1E3A24"); gg.addColorStop(1,"#122218");
+  ctx.fillStyle = gg; ctx.fillRect(0,Math.max(0,hy),W,H);
+}
+function drawHorizonLine(ctx, pitch, roll) {
+  const hy=H/2+pitch*4, cx=W/2, cy=H/2;
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(roll*Math.PI/180); ctx.translate(-cx,-cy);
+  ctx.strokeStyle="#5EEAD4"; ctx.lineWidth=1.5; ctx.globalAlpha=0.6;
+  ctx.beginPath(); ctx.moveTo(-100,hy); ctx.lineTo(W+100,hy); ctx.stroke(); ctx.globalAlpha=1;
+  ctx.strokeStyle="#5EEAD466"; ctx.lineWidth=1; ctx.font=`11px ${font}`; ctx.fillStyle="#5EEAD488"; ctx.textAlign="right";
+  for(let d=-20;d<=20;d+=5){if(!d)continue;const y=hy-d*4,hw=d%10===0?60:30;
+    ctx.beginPath();ctx.moveTo(cx-hw,y);ctx.lineTo(cx+hw,y);ctx.stroke();
+    if(d%10===0)ctx.fillText(`${d}`,cx-hw-6,y+4);}
+  ctx.restore();
+}
+function drawGround(ctx,pitch,roll,elapsed){
+  const hy=H/2+pitch*4,sp=elapsed*0.08,vx=W/2+roll*2;
+  ctx.save();ctx.strokeStyle="#5EEAD4";ctx.lineWidth=0.5;ctx.globalAlpha=0.15;
+  for(let i=-6;i<=6;i++){ctx.beginPath();ctx.moveTo(vx,hy);ctx.lineTo(vx+i*200,H+40);ctx.stroke();}
+  for(let d=0;d<8;d++){const t=((d*50+sp)%400)/400;ctx.globalAlpha=t*0.3;
+    ctx.beginPath();ctx.moveTo(0,hy+t*t*(H-hy+40));ctx.lineTo(W,hy+t*t*(H-hy+40));ctx.stroke();}
+  ctx.restore();
+}
+function drawStars(ctx,pitch){
+  ctx.fillStyle="#fff";const s=[.12,.34,.56,.78,.91,.23,.45,.67,.89,.11,.33,.55,.77,.99,.15,.37];
+  for(let i=0;i<s.length;i++){const x=(s[i]*3.7*W)%W,y=s[(i+3)%s.length]*H*0.35+pitch*2;
+    if(y>0&&y<H/2-30){ctx.globalAlpha=0.3+s[(i+5)%s.length]*0.5;ctx.beginPath();ctx.arc(x,y,0.8+s[i]*0.8,0,Math.PI*2);ctx.fill();}}
+  ctx.globalAlpha=1;
+}
+function drawMountains(ctx,pitch,roll){
+  const hy=H/2+pitch*4,sh=roll*1.5;ctx.save();
+  ctx.fillStyle="#1A3A2A";ctx.globalAlpha=0.5;ctx.beginPath();ctx.moveTo(-20,hy);
+  [[.06,25],[.15,50],[.28,35],[.4,65],[.52,40],[.65,55],[.78,70],[.88,30],[1.02,45]].forEach(([p,h])=>ctx.lineTo(p*W+sh,hy-h));
+  ctx.lineTo(W+20,hy);ctx.closePath();ctx.fill();
+  ctx.fillStyle="#152E20";ctx.globalAlpha=0.6;ctx.beginPath();ctx.moveTo(-20,hy+5);
+  [[.05,15],[.18,35],[.32,20],[.48,45],[.6,25],[.75,38],[.9,22],[1.02,30]].forEach(([p,h])=>ctx.lineTo(p*W+sh*1.5,hy-h+10));
+  ctx.lineTo(W+20,hy+5);ctx.closePath();ctx.fill();ctx.restore();
+}
+function drawFD(ctx,x,y){
+  ctx.save();ctx.strokeStyle="#FBBF24";ctx.lineWidth=2.5;ctx.shadowColor="#FBBF24";ctx.shadowBlur=8;
+  ctx.beginPath();ctx.moveTo(x-40,y+12);ctx.lineTo(x-8,y);ctx.lineTo(x,y-4);ctx.lineTo(x+8,y);ctx.lineTo(x+40,y+12);ctx.stroke();
+  ctx.shadowBlur=0;ctx.fillStyle="#FBBF24";ctx.beginPath();ctx.arc(x,y,2.5,0,Math.PI*2);ctx.fill();ctx.restore();
+}
+function drawAircraft(ctx,cx,cy){
+  ctx.strokeStyle="#E4E2EE";ctx.lineWidth=2;ctx.fillStyle="#E4E2EE";
+  ctx.beginPath();ctx.moveTo(cx-50,cy);ctx.lineTo(cx-14,cy);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(cx+14,cy);ctx.lineTo(cx+50,cy);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(cx-50,cy);ctx.lineTo(cx-50,cy+8);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(cx+50,cy);ctx.lineTo(cx+50,cy+8);ctx.stroke();
+  ctx.beginPath();ctx.arc(cx,cy,3,0,Math.PI*2);ctx.fill();
+}
+function drawHUD(ctx,spd,alt,hdg,err,elapsed,dur){
+  ctx.save();ctx.font=`13px ${font}`;ctx.fillStyle="#5EEAD4";ctx.globalAlpha=0.85;
+  ctx.textAlign="right";ctx.fillText("KTS",70,36);ctx.font=`22px ${font}`;ctx.fillText(Math.round(spd)+"",70,58);
+  ctx.font=`13px ${font}`;ctx.textAlign="left";ctx.fillText("ALT",W-70,36);ctx.font=`22px ${font}`;ctx.fillText(Math.round(alt)+"",W-70,58);
+  ctx.font=`13px ${font}`;ctx.textAlign="center";ctx.fillText("HDG",W/2,30);ctx.font=`18px ${font}`;
+  ctx.fillText(Math.round(hdg).toString().padStart(3,"0")+"°",W/2,50);
+  ctx.font=`12px ${font}`;ctx.fillStyle=err<30?"#34D399":err<60?"#FBBF24":"#F87171";ctx.textAlign="center";
+  ctx.fillText(`DEV ${Math.round(err)}px`,W/2,H-36);
+  const p=elapsed/dur;ctx.fillStyle="#27272F";ctx.fillRect(40,H-16,W-80,5);ctx.fillStyle="#5EEAD4";ctx.fillRect(40,H-16,(W-80)*(1-p),5);
+  ctx.strokeStyle="#5EEAD433";ctx.lineWidth=1;const m=16,s=30;
+  ctx.beginPath();ctx.moveTo(m,m+s);ctx.lineTo(m,m);ctx.lineTo(m+s,m);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(W-m-s,m);ctx.lineTo(W-m,m);ctx.lineTo(W-m,m+s);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(m,H-m-s);ctx.lineTo(m,H-m);ctx.lineTo(m+s,H-m);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(W-m-s,H-m);ctx.lineTo(W-m,H-m);ctx.lineTo(W-m,H-m-s);ctx.stroke();
+  ctx.restore();
+}
+function drawStick(ctx,sx,sy){
+  const ox=56,oy=H-56,r=28;ctx.save();ctx.globalAlpha=0.35;ctx.strokeStyle="#5EEAD4";ctx.lineWidth=1;
+  ctx.beginPath();ctx.arc(ox,oy,r,0,Math.PI*2);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(ox-r,oy);ctx.lineTo(ox+r,oy);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(ox,oy-r);ctx.lineTo(ox,oy+r);ctx.stroke();
+  ctx.globalAlpha=0.9;ctx.fillStyle="#5EEAD4";
+  ctx.beginPath();ctx.arc(ox+clamp(sx,-1,1)*(r-4),oy+clamp(sy,-1,1)*(r-4),4,0,Math.PI*2);ctx.fill();ctx.restore();
+}
+function drawScanlines(ctx){ctx.save();ctx.fillStyle="#000";ctx.globalAlpha=0.04;for(let y=0;y<H;y+=3)ctx.fillRect(0,y,W,1);ctx.restore();}
+
+// ─── Secondary Task Visuals (NO on-screen hints, NO key legends) ───
+
+// VISUAL-SPATIAL: Landolt C at a random peripheral position.
+// Gap on LEFT side = fire (left-click). Gap on RIGHT side = flare (right-click).
+// The ring is small enough (~12px radius) that you MUST foveate it to see the gap direction.
+// A subtle outer pulse ring helps you find it, but the gap itself requires direct fixation.
+function drawLandoltC(ctx, x, y, isMissile, age) {
+  const r = 11; // small enough to require foveal vision for gap discrimination
+  const gapAngle = isMissile ? Math.PI : 0; // gap on left = fire, gap on right = flare
+  const gapSize = 0.45; // radians (~26 degrees of arc removed)
+
+  // Outer locator pulse — large, faint, helps find the target without revealing the gap
+  const pulseR = 28 + Math.sin(age * 6) * 4;
+  ctx.save();
+  ctx.globalAlpha = 0.2 + Math.sin(age * 6) * 0.1;
+  ctx.strokeStyle = "#FFFFFF";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(x, y, pulseR, 0, Math.PI * 2); ctx.stroke();
+
+  // The Landolt C itself
+  ctx.globalAlpha = 0.95;
+  ctx.strokeStyle = "#FFFFFF";
+  ctx.lineWidth = 3.5;
+  ctx.beginPath();
+  ctx.arc(x, y, r, gapAngle + gapSize / 2, gapAngle + Math.PI * 2 - gapSize / 2);
+  ctx.stroke();
+
+  // Small filled center dot to anchor fixation
+  ctx.fillStyle = "#FFFFFF";
+  ctx.globalAlpha = 0.4;
+  ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI * 2); ctx.fill();
+
+  ctx.restore();
+}
+
+// VISUAL-VERBAL: Text at a random peripheral position (NOT on the flight director).
+// Large, high-contrast text. Amber/gold on dark for optimal legibility against both sky and ground.
+function drawVerbalIndicator(ctx, isMissile, x, y, age) {
+  const blink = Math.sin(age * 8) > -0.3;
+  ctx.save();
+
+  // Dark backing pill for contrast against any background
+  const text = isMissile ? "MISSILE" : "FLARE";
+  ctx.font = `bold 28px ${font}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const metrics = ctx.measureText(text);
+  const pw = metrics.width + 24, ph = 40;
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.beginPath();
+  ctx.roundRect(x - pw/2, y - ph/2, pw, ph, 8);
+  ctx.fill();
+
+  // Text in amber — high contrast on the dark pill, visible against any scene background
+  ctx.fillStyle = blink ? "#FFD666" : "#FFD66688";
+  ctx.fillText(text, x, y);
+
+  ctx.restore();
+}
+
+// ─── Flight path ───
+function useFlightPath() {
+  return useCallback((elapsed) => {
+    const t = elapsed / 1000;
+    return {
+      fdX: W/2
+        + Math.sin(t*0.61)*87.5
+        + Math.sin(t*1.37+0.8)*56
+        + Math.sin(t*2.53+2.1)*37.5
+        + Math.sin(t*3.71+4.2)*22.5
+        + Math.sin(t*5.09+1.4)*12.5,
+      fdY: H/2
+        + Math.sin(t*0.53+0.3)*69
+        + Math.sin(t*1.19+1.7)*44
+        + Math.sin(t*2.17+3.3)*27.5
+        + Math.sin(t*3.43+0.6)*17.5
+        + Math.sin(t*4.79+2.8)*10,
+      speed: 240+Math.sin(t*.4)*15,
+      alt: 3500+Math.sin(t*.2)*200+Math.cos(t*.5)*100,
+      heading: (270+Math.sin(t*.15)*20+360)%360,
+    };
+  }, []);
+}
+
+// ─── Trial ───
+function Trial({ condition, onDone, duration = DURATION, isPractice = false }) {
+  const canvasRef = useRef(null);
+  const updatePath = useFlightPath();
+  const posRef = useRef({x:W/2,y:H/2});
+  const stickRef = useRef({x:W/2,y:H/2});
+  const samplesRef = useRef([]);
+  const flyingRef = useRef(false);
+  const startTimeRef = useRef(0);
+  const alertRef = useRef({
+    active:false, isMissile:false, born:0, nextSpawn:0,
+    hits:0, total:0, responded:false,
+    feedbackUntil:0, feedbackCorrect:false,
+    alertX:0, alertY:0,
+  });
+  const [phase, setPhase] = useState("countdown");
+  const [count, setCount] = useState(3);
+  const [result, setResult] = useState(null);
+
+  // Countdown
+  useEffect(()=>{
+    if(phase!=="countdown")return;
+    if(count>0){const t=setTimeout(()=>setCount(c=>c-1),1000);return()=>clearTimeout(t);}
+    else{
+      setPhase("flying"); flyingRef.current=true; startTimeRef.current=performance.now();
+      samplesRef.current=[]; posRef.current={x:W/2,y:H/2}; stickRef.current={x:W/2,y:H/2};
+      const a=alertRef.current; a.active=false; a.hits=0; a.total=0;
+      a.nextSpawn=performance.now()+2500; a.responded=false; a.feedbackUntil=0;
+    }
+  },[phase,count]);
+
+  // Mouse
+  useEffect(()=>{
+    const canvas=canvasRef.current; if(!canvas)return;
+    const onMove=e=>{const r=canvas.getBoundingClientRect();stickRef.current={x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height};};
+    const onLeave=()=>{stickRef.current={x:W/2,y:H/2};};
+    const onTouch=e=>{e.preventDefault();const t=e.touches[0],r=canvas.getBoundingClientRect();stickRef.current={x:(t.clientX-r.left)*W/r.width,y:(t.clientY-r.top)*H/r.height};};
+    const onTouchEnd=()=>{stickRef.current={x:W/2,y:H/2};};
+    canvas.addEventListener("mousemove",onMove); canvas.addEventListener("mouseleave",onLeave);
+    canvas.addEventListener("touchmove",onTouch,{passive:false}); canvas.addEventListener("touchstart",onTouch,{passive:false}); canvas.addEventListener("touchend",onTouchEnd);
+    return()=>{canvas.removeEventListener("mousemove",onMove);canvas.removeEventListener("mouseleave",onLeave);
+      canvas.removeEventListener("touchmove",onTouch);canvas.removeEventListener("touchstart",onTouch);canvas.removeEventListener("touchend",onTouchEnd);};
+  },[]);
+
+  // Click response — LEFT click = fire, RIGHT click = flare
+  useEffect(()=>{
+    const canvas = canvasRef.current; if(!canvas) return;
+    const onClick = (e) => {
+      const a = alertRef.current;
+      if (!a.active || a.responded) return;
+      // button 0 = left click, button 2 = right click
+      const clickedMissile = e.button === 0;
+      const clickedFlare = e.button === 2;
+      if (!clickedMissile && !clickedFlare) return;
+
+      a.responded = true;
+      const correct = (clickedMissile && a.isMissile) || (clickedFlare && !a.isMissile);
+      if (correct) a.hits++;
+      a.feedbackUntil = performance.now() + 500;
+      a.feedbackCorrect = correct;
+    };
+    const onContext = (e) => { e.preventDefault(); }; // prevent right-click menu
+    canvas.addEventListener("mousedown", onClick);
+    canvas.addEventListener("contextmenu", onContext);
+    return () => { canvas.removeEventListener("mousedown", onClick); canvas.removeEventListener("contextmenu", onContext); };
+  },[]);
+
+  // Spawn alert
+  function spawnAlert(now, secondary) {
+    const a = alertRef.current;
+    a.active = true; a.born = now; a.responded = false; a.total++;
+    a.isMissile = Math.random() > 0.5;
+
+    if (secondary === "visual-spatial" || secondary === "visual-verbal") {
+      // Place indicator at a random peripheral position, at least 180px from center
+      let lx, ly, attempts = 0;
+      do {
+        lx = 80 + Math.random() * (W - 160);
+        ly = 80 + Math.random() * (H - 160);
+        attempts++;
+      } while (Math.hypot(lx - W/2, ly - H/2) < 180 && attempts < 20);
+      a.alertX = lx;
+      a.alertY = ly;
+    } else if (secondary === "auditory-verbal") {
+      say(a.isMissile ? "missile" : "flare");
+    } else if (secondary === "auditory-spatial") {
+      // Missile = left ear, Flare = right ear
+      const pan = a.isMissile ? -1.0 : 1.0;
+      playAlarmPanned(pan);
+    }
+    // Visual tasks are drawn per-frame, no spawn action needed
+
+    a.nextSpawn = now + ALERT_INTERVAL_MIN + Math.random() * (ALERT_INTERVAL_MAX - ALERT_INTERVAL_MIN);
+  }
+
+  // Animation
+  useEffect(()=>{
+    if(phase!=="flying")return;
+    const canvas=canvasRef.current; if(!canvas)return;
+    const ctx=canvas.getContext("2d"); let animId;
+
+    function frame(){
+      if(!flyingRef.current)return;
+      const now=performance.now(), elapsed=now-startTimeRef.current;
+
+      if(elapsed>duration){
+        flyingRef.current=false;
+        const avg=samplesRef.current.length>0?samplesRef.current.reduce((a,b)=>a+b,0)/samplesRef.current.length:999;
+        const a=alertRef.current;
+        setResult({avgError:Math.round(avg*10)/10, alertHits:a.hits, alertTotal:a.total});
+        setPhase("done"); return;
+      }
+
+      // Stick physics
+      const sx=stickRef.current.x-W/2, sy=stickRef.current.y-H/2, mag=Math.hypot(sx,sy);
+      if(mag>DEADZONE){const eff=(mag-DEADZONE)*STICK_GAIN,ang=Math.atan2(sy,sx);
+        posRef.current.x+=Math.cos(ang)*eff; posRef.current.y+=Math.sin(ang)*eff;}
+      posRef.current.x+=(W/2-posRef.current.x)*0.003; posRef.current.y+=(H/2-posRef.current.y)*0.003;
+      posRef.current.x=clamp(posRef.current.x,20,W-20); posRef.current.y=clamp(posRef.current.y,20,H-20);
+
+      const fp=updatePath(elapsed), px=posRef.current.x, py=posRef.current.y;
+      const err=Math.hypot(px-fp.fdX,py-fp.fdY);
+      samplesRef.current.push(err);
+      const pitch=(py-H/2)*0.08, roll=(px-W/2)*0.04;
+      const snx=mag>DEADZONE?(sx/mag)*((mag-DEADZONE)/150):0, sny=mag>DEADZONE?(sy/mag)*((mag-DEADZONE)/150):0;
+
+      // Alert logic
+      const a=alertRef.current, sec=condition.secondary;
+      if(a.active&&!a.responded&&now-a.born>ALERT_WINDOW){a.responded=true;a.feedbackUntil=now+400;a.feedbackCorrect=false;}
+      if(a.active&&a.responded&&now>a.feedbackUntil){a.active=false;}
+      if(sec&&!a.active&&now>a.nextSpawn){spawnAlert(now,sec);}
+
+      // Draw
+      ctx.clearRect(0,0,W,H);
+      drawSky(ctx,pitch); drawStars(ctx,pitch); drawMountains(ctx,pitch,roll);
+      drawGround(ctx,pitch,roll,elapsed); drawHorizonLine(ctx,pitch,roll);
+      drawFD(ctx,fp.fdX,fp.fdY);
+
+      // Secondary visuals
+      if(sec==="visual-spatial"&&a.active&&!a.responded)
+        drawLandoltC(ctx, a.alertX, a.alertY, a.isMissile, (now-a.born)/1000);
+      if(sec==="visual-verbal"&&a.active&&!a.responded)
+        drawVerbalIndicator(ctx, a.isMissile, a.alertX, a.alertY, (now-a.born)/1000);
+
+      // Feedback
+      if(a.active&&a.responded&&now<a.feedbackUntil){
+        ctx.save(); ctx.font=`bold 14px ${font}`; ctx.textAlign="center";
+        ctx.fillStyle=a.feedbackCorrect?"#34D399":"#F87171";
+        ctx.fillText(a.feedbackCorrect?"CONFIRMED":"WRONG",W/2,H-56);
+        ctx.restore();
+      }
+
+      drawAircraft(ctx,px,py);
+      drawHUD(ctx,fp.speed,fp.alt,fp.heading,err,elapsed,duration);
+      drawStick(ctx,snx,sny);
+      drawScanlines(ctx);
+      animId=requestAnimationFrame(frame);
+    }
+    animId=requestAnimationFrame(frame);
+    return()=>{cancelAnimationFrame(animId);flyingRef.current=false;};
+  },[phase,condition,updatePath]);
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:10}}>
+      <div style={{fontSize:13,color:condition.color,fontWeight:600}}>{isPractice ? `Practice — ${condition.label}` : condition.label}</div>
+      <div style={{position:"relative"}}>
+        <canvas ref={canvasRef} width={W} height={H} style={{
+          width:"100%",maxWidth:W,aspectRatio:`${W}/${H}`,borderRadius:8,
+          border:"1px solid #1A2A30",cursor:phase==="flying"?"crosshair":"default",
+        }}/>
+        {phase==="countdown"&&(
+          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(8,12,18,0.85)",borderRadius:8}}>
+            <span style={{fontSize:64,fontWeight:700,color:condition.color,fontFamily:font}}>{count>0?count:"FLY"}</span>
+          </div>)}
+        {phase==="done"&&result&&(
+          <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"rgba(8,12,18,0.88)",borderRadius:8}}>
+            <div style={{fontSize:12,letterSpacing:"0.12em",color:"#5EEAD488",textTransform:"uppercase",marginBottom:10}}>
+              {isPractice ? "Practice complete" : `${condition.label} complete`}
+            </div>
+            <div style={{fontSize:13,color:"#7E7C92",marginBottom:4}}>Tracking error</div>
+            <div style={{fontSize:48,fontWeight:700,fontFamily:font,color:condition.color,lineHeight:1}}>{result.avgError}<span style={{fontSize:18,color:"#7E7C92"}}>px</span></div>
+            {condition.secondary&&<div style={{fontSize:13,color:"#7E7C92",marginTop:10}}>Response accuracy: {result.alertHits}/{result.alertTotal}</div>}
+            {isPractice&&<div style={{fontSize:12,color:"#7E7C9288",marginTop:6}}>This was practice — score is not recorded</div>}
+            <button onClick={()=>onDone(result)} style={{...btnStyle(),marginTop:24}}
+              onMouseEnter={e=>e.target.style.background="#5EEAD411"} onMouseLeave={e=>e.target.style.background="transparent"}>
+              {isPractice ? "Next" : "Continue"}
+            </button>
+          </div>)}
+      </div>
+    </div>
+  );
+}
+
+// ─── Briefing ───
+function Briefing({ condition, condIdx, total, onReady, isPractice = false }) {
+  const c = condition, sec = c.secondary;
+  const box = { background:"#141419", border:"1px solid #27272F", borderRadius:10, padding:16, marginBottom:16, lineHeight:1.7, textAlign:"left" };
+  const dim = { fontSize:13, color:"#7E7C92" };
+  const hl = (col) => ({ fontSize:13, color:col, fontWeight:600 });
+  const sectionLabel = (col, text) => ({ ...hl(col), fontSize:11, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:8, display:"block" });
+
+  return (
+    <div style={{maxWidth:720,padding:"24px 0",textAlign:"center"}}>
+      {isPractice && (
+        <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.12em",color:"#FBBF24",textTransform:"uppercase",marginBottom:4}}>
+          Practice round
+        </div>
+      )}
+      <div style={{fontSize:12,color:"#7E7C92",marginBottom:6}}>{isPractice ? "Practice" : "Condition"} {condIdx+1} of {total}</div>
+      <div style={{fontSize:22,fontWeight:700,color:c.color,marginBottom:4}}>{c.label}</div>
+      <div style={{width:50,height:2,background:`linear-gradient(90deg,transparent,${c.color},transparent)`,margin:"12px auto 20px"}}/>
+
+      {/* Primary task — always shown */}
+      <div style={box}>
+        <span style={sectionLabel("#5EEAD4","")}>Primary task — always active</span>
+        <div style={dim}>
+          Keep the <span style={{color:"#E4E2EE",fontWeight:600}}>white aircraft wings</span> aligned with the <span style={{color:"#FBBF24",fontWeight:600}}>gold flight director (V shape)</span>.
+          Mouse = flight stick. Offset from center controls steering rate. Center = neutral. Off-screen = auto-centers.
+        </div>
+      </div>
+
+      {/* The decision — same for all non-baseline */}
+      {sec && (
+        <div style={box}>
+          <span style={sectionLabel("#E4E2EE","")}>The decision — same every time</span>
+          <div style={dim}>
+            You are flying over a warzone. Periodically you'll receive an alert telling you to either launch your <span style={{color:"#E4E2EE",fontWeight:600}}>weapons</span> or deploy a <span style={{color:"#E4E2EE",fontWeight:600}}>flare</span>.
+          </div>
+          <div style={{display:"flex",gap:16,justifyContent:"center",marginTop:14,marginBottom:6}}>
+            <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6}}>
+              <div style={{width:48,height:32,borderRadius:6,background:"#1E1E28",border:"1px solid #3A3A48",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontFamily:font,color:"#E4E2EE",fontWeight:600}}>L-CLICK</div>
+              <span style={{fontSize:12,color:"#E4E2EE"}}>Missile</span>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6}}>
+              <div style={{width:48,height:32,borderRadius:6,background:"#1E1E28",border:"1px solid #3A3A48",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontFamily:font,color:"#E4E2EE",fontWeight:600}}>R-CLICK</div>
+              <span style={{fontSize:12,color:"#E4E2EE"}}>Flare</span>
+            </div>
+          </div>
+          <div style={{...dim,fontSize:12,textAlign:"center",marginTop:4}}>
+            The response is always left-click or right-click. Only how you <em>receive</em> the alert changes.
+          </div>
+        </div>
+      )}
+
+      {/* How the alert is delivered */}
+      {!sec && (
+        <div style={box}>
+          <span style={sectionLabel(c.color,"")}>No secondary task</span>
+          <div style={dim}>This is your baseline. Focus entirely on tracking. Your score here is the reference for measuring interference from the other conditions.</div>
+        </div>
+      )}
+
+      {sec==="visual-spatial" && (
+        <div style={box}>
+          <span style={sectionLabel(c.color,"")}>Alert type — Landolt ring at a random location</span>
+          <div style={dim}>
+            A small <span style={{color:"#E4E2EE",fontWeight:600}}>white ring with a gap</span> will appear
+            somewhere on the display. A faint pulsing circle helps you find it, but you must
+            <span style={{color:c.color,fontWeight:600}}> look directly at the ring</span> to see which side the gap is on.
+          </div>
+          <div style={{display:"flex",justifyContent:"center",gap:40,margin:"16px 0"}}>
+            <div style={{textAlign:"center"}}>
+              <svg width="48" height="48" viewBox="0 0 48 48">
+                <circle cx="24" cy="24" r="11" fill="none" stroke="#FFF" strokeWidth="3.5"
+                  strokeDasharray="55.3 14" strokeDashoffset="21" />
+              </svg>
+              <div style={{fontSize:12,color:"#E4E2EE",marginTop:2}}>Gap on LEFT = Missile</div>
+              <div style={{fontSize:11,color:"#7E7C9288"}}>→ Left-click</div>
+            </div>
+            <div style={{textAlign:"center"}}>
+              <svg width="48" height="48" viewBox="0 0 48 48">
+                <circle cx="24" cy="24" r="11" fill="none" stroke="#FFF" strokeWidth="3.5"
+                  strokeDasharray="55.3 14" strokeDashoffset="-13.5" />
+              </svg>
+              <div style={{fontSize:12,color:"#E4E2EE",marginTop:2}}>Gap on RIGHT = Flare</div>
+              <div style={{fontSize:11,color:"#7E7C9288"}}>→ Right-click</div>
+            </div>
+          </div>
+          <div style={{...dim,fontSize:12,textAlign:"center"}}>
+            The ring is small — you cannot tell the gap direction from peripheral vision alone.
+            You must shift your eyes to it, identify the gap, then respond. This is the spatial demand.
+          </div>
+        </div>
+      )}
+
+      {sec==="visual-verbal" && (
+        <div style={box}>
+          <span style={sectionLabel(c.color,"")}>Alert type — text at a random location</span>
+          <div style={dim}>
+            A word appears at a random position on the display. Read it to know the action:
+          </div>
+          <div style={{display:"flex",justifyContent:"center",gap:32,margin:"14px 0"}}>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontFamily:font,fontSize:22,fontWeight:700,color:"#FFD666",marginBottom:4,background:"rgba(0,0,0,0.5)",padding:"4px 12px",borderRadius:6,display:"inline-block"}}>MISSILE</div>
+              <div style={{fontSize:11,color:"#7E7C9288",marginTop:4}}>→ Left-click</div>
+            </div>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontFamily:font,fontSize:22,fontWeight:700,color:"#FFD666",marginBottom:4,background:"rgba(0,0,0,0.5)",padding:"4px 12px",borderRadius:6,display:"inline-block"}}>FLARE</div>
+              <div style={{fontSize:11,color:"#7E7C9288",marginTop:4}}>→ Right-click</div>
+            </div>
+          </div>
+          <div style={{...dim,fontSize:12,textAlign:"center"}}>
+            The text appears at a random spot — you must find it and read it. The demand is visual search + verbal processing.
+          </div>
+        </div>
+      )}
+
+      {sec==="auditory-verbal" && (
+        <div style={box}>
+          <span style={sectionLabel(c.color,"")}>Alert type — spoken word</span>
+          <div style={dim}>
+            You'll hear a voice say one of two words:
+          </div>
+          <div style={{display:"flex",justifyContent:"center",gap:32,margin:"14px 0"}}>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontFamily:font,fontSize:16,fontWeight:700,color:"#E4E2EE",marginBottom:4}}>"Missile"</div>
+              <div style={{fontSize:11,color:"#7E7C9288"}}>→ Left-click</div>
+            </div>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontFamily:font,fontSize:16,fontWeight:700,color:"#E4E2EE",marginBottom:4}}>"Flare"</div>
+              <div style={{fontSize:11,color:"#7E7C9288"}}>→ Right-click</div>
+            </div>
+          </div>
+          <div style={{...dim,fontSize:12,textAlign:"center"}}>
+            Nothing appears on screen. This is purely auditory + verbal.
+          </div>
+        </div>
+      )}
+
+      {sec==="auditory-spatial" && (
+        <div style={box}>
+          <span style={sectionLabel(c.color,"")}>Alert type — directional alarm</span>
+          <div style={dim}>
+            You'll hear a buzzing alarm in your headphones. The <span style={{color:c.color,fontWeight:600}}>ear it plays in</span> tells you the answer:
+          </div>
+          <div style={{display:"flex",justifyContent:"center",gap:32,margin:"14px 0"}}>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontFamily:font,fontSize:14,fontWeight:700,color:"#E4E2EE",marginBottom:4}}>Left ear</div>
+              <div style={{fontSize:12,color:"#E4E2EE"}}>= Missile</div>
+              <div style={{fontSize:11,color:"#7E7C9288"}}>→ Left-click</div>
+            </div>
+            <div style={{textAlign:"center"}}>
+              <div style={{fontFamily:font,fontSize:14,fontWeight:700,color:"#E4E2EE",marginBottom:4}}>Right ear</div>
+              <div style={{fontSize:12,color:"#E4E2EE"}}>= Flare</div>
+              <div style={{fontSize:11,color:"#7E7C9288"}}>→ Right-click</div>
+            </div>
+          </div>
+          <div style={{...dim,fontSize:12,textAlign:"center"}}>
+            Nothing on screen. Headphones required. The demand is localizing which ear the sound came from.
+          </div>
+        </div>
+      )}
+
+      <div style={{...dim,marginBottom:24,fontSize:12}}>
+        {isPractice
+          ? `Practice trial — ${PRACTICE_DURATION/1000} seconds. Get comfortable with the controls and alert type.`
+          : `Trial lasts ${DURATION/1000} seconds. Alerts every 3–5 sec. 3-second response window.`}
+      </div>
+
+      <button onClick={onReady} style={btnStyle(c.color)}
+        onMouseEnter={e=>e.target.style.background=`${c.color}11`}
+        onMouseLeave={e=>e.target.style.background="transparent"}
+      >{isPractice ? "Start practice" : "I'm ready — start trial"}</button>
+    </div>
+  );
+}
+
+// ─── NASA Raw TLX ───
+const TLX_SCALES = [
+  { id: "mental", label: "Mental demand", desc: "How mentally demanding was the task?", lo: "Very low", hi: "Very high" },
+  { id: "performance", label: "Performance", desc: "How successful were you in accomplishing what you were asked to do?", lo: "Perfect", hi: "Failure" },
+  { id: "frustration", label: "Frustration", desc: "How insecure, discouraged, irritated, stressed, and annoyed were you?", lo: "Very low", hi: "Very high" },
+];
+
+function NasaTLX({ condition, onSubmit }) {
+  const [ratings, setRatings] = useState({});
+  const allDone = TLX_SCALES.every(s => ratings[s.id] !== undefined);
+
+  const setRating = (id, val) => setRatings(prev => ({ ...prev, [id]: val }));
+
+  return (
+    <div style={{ maxWidth: 520, padding: "24px 0", textAlign: "center" }}>
+      <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.12em", color: "#5EEAD488", textTransform: "uppercase", marginBottom: 6 }}>
+        NASA Raw TLX
+      </div>
+      <div style={{ fontSize: 18, fontWeight: 700, color: condition.color, marginBottom: 4 }}>
+        {condition.label} — Workload rating
+      </div>
+      <div style={{ fontSize: 12, color: "#7E7C92", marginBottom: 20 }}>
+        Rate your experience for the trial you just completed.
+      </div>
+
+      {TLX_SCALES.map(scale => (
+        <div key={scale.id} style={{
+          background: "#141419", border: "1px solid #27272F", borderRadius: 10,
+          padding: "14px 16px", marginBottom: 10, textAlign: "left",
+        }}>
+          <div style={{ fontSize: 13, color: "#E4E2EE", fontWeight: 600, marginBottom: 2 }}>{scale.label}</div>
+          <div style={{ fontSize: 11, color: "#7E7C92", marginBottom: 10 }}>{scale.desc}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 10, color: "#7E7C92", minWidth: 50, textAlign: "right" }}>{scale.lo}</span>
+            <input
+              type="range"
+              min={0} max={100} step={5}
+              value={ratings[scale.id] ?? 50}
+              onChange={e => setRating(scale.id, parseInt(e.target.value))}
+              style={{ flex: 1, accentColor: condition.color }}
+            />
+            <span style={{ fontSize: 10, color: "#7E7C92", minWidth: 50 }}>{scale.hi}</span>
+          </div>
+          <div style={{ textAlign: "center", fontSize: 13, fontFamily: font, color: condition.color, fontWeight: 600, marginTop: 4 }}>
+            {ratings[scale.id] ?? 50}
+          </div>
+        </div>
+      ))}
+
+      <button
+        onClick={() => onSubmit(ratings)}
+        disabled={!allDone}
+        style={{ ...btnStyle(condition.color), marginTop: 12, opacity: allDone ? 1 : 0.4 }}
+        onMouseEnter={e => allDone && (e.target.style.background = `${condition.color}11`)}
+        onMouseLeave={e => (e.target.style.background = "transparent")}
+      >Submit ratings</button>
+    </div>
+  );
+}
+
+// ─── Results ───
+function Results({ data, onRestart }) {
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:20,alignItems:"center",maxWidth:720}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.15em",color:"#5EEAD488",textTransform:"uppercase"}}>Experiment complete</div>
+        <div style={{fontSize:20,fontWeight:700,color:"#E4E2EE",marginTop:4}}>Dual-task interference results</div>
+      </div>
+      <div style={{width:"100%",background:"#141419",borderRadius:14,border:"1px solid #27272F",padding:20}}>
+        <div style={{fontSize:13,color:"#7E7C92",marginBottom:16}}>Tracking error (px) — lower is better</div>
+        <div style={{display:"flex",alignItems:"flex-end",gap:8,height:180}}>
+          {CONDITIONS.map(c=>{
+            const val=data[c.id]?.avgError??0;
+            const mx=Math.max(...CONDITIONS.map(cc=>data[cc.id]?.avgError??0),1);
+            return(<div key={c.id} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+              <span style={{fontSize:11,fontFamily:font,color:c.color,fontWeight:600}}>{Math.round(val)}</span>
+              <div style={{width:"100%",height:(val/mx)*140,background:c.color,borderRadius:6,minHeight:4,opacity:0.85}}/>
+              <span style={{fontSize:9,color:"#7E7C92",textAlign:"center",lineHeight:1.2}}>{c.label.replace("–","\u2011")}</span>
+            </div>);})}
+        </div>
+      </div>
+      <div style={{width:"100%",background:"#141419",borderRadius:14,border:"1px solid #27272F",padding:20}}>
+        <div style={{fontSize:13,color:"#7E7C92",marginBottom:16}}>Response accuracy</div>
+        {CONDITIONS.map(c=>{
+          const hits=data[c.id]?.alertHits??0, total=data[c.id]?.alertTotal??0;
+          const pct=total>0?Math.round((hits/total)*100):0;
+          return(<div key={c.id} style={{marginBottom:14}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+              <span style={{fontSize:13,color:c.color,fontWeight:600}}>{c.label}</span>
+              <span style={{fontSize:13,fontFamily:font,color:"#E4E2EE"}}>{hits}/{total} ({pct}%)</span>
+            </div>
+            <div style={{height:8,background:"#27272F",borderRadius:4,overflow:"hidden"}}>
+              <div style={{height:"100%",width:`${pct}%`,background:c.color,borderRadius:4}}/>
+            </div>
+          </div>);})}
+      </div>
+      {/* NASA TLX Summary */}
+      <div style={{width:"100%",background:"#141419",borderRadius:14,border:"1px solid #27272F",padding:20}}>
+        <div style={{fontSize:13,color:"#7E7C92",marginBottom:16}}>NASA TLX — Raw workload scores</div>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,fontFamily:font}}>
+            <thead>
+              <tr>
+                <th style={{textAlign:"left",color:"#7E7C92",fontWeight:500,padding:"4px 6px",borderBottom:"1px solid #27272F"}}></th>
+                {CONDITIONS.map(c=>(
+                  <th key={c.id} style={{textAlign:"center",color:c.color,fontWeight:600,padding:"4px 6px",borderBottom:"1px solid #27272F",fontSize:10}}>
+                    {c.label.split("–")[1]?.trim() || c.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {TLX_SCALES.map(scale=>(
+                <tr key={scale.id}>
+                  <td style={{color:"#7E7C92",padding:"4px 6px",borderBottom:"1px solid #1B1B22",fontSize:11}}>{scale.label}</td>
+                  {CONDITIONS.map(c=>{
+                    const val = data[c.id]?.tlx?.[scale.id];
+                    return(
+                      <td key={c.id} style={{textAlign:"center",color:"#E4E2EE",padding:"4px 6px",borderBottom:"1px solid #1B1B22"}}>
+                        {val !== undefined ? val : "—"}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div style={{width:"100%",background:"#1B1B22",borderRadius:14,border:"1px solid #27272F",padding:16,fontSize:13,color:"#7E7C92",lineHeight:1.7}}>
+        <strong style={{color:"#E4E2EE"}}>MRT prediction:</strong> Visual–spatial (Landolt ring) should produce
+        the highest tracking error — both share visual modality and spatial coding. Auditory–verbal (spoken word)
+        should produce the lowest — different modality, different code. Visual–verbal and auditory–spatial
+        should fall between, each sharing one dimension with the primary task.
+      </div>
+      <button onClick={onRestart} style={{...btnStyle(),marginTop:4}}
+        onMouseEnter={e=>e.target.style.background="#5EEAD411"} onMouseLeave={e=>e.target.style.background="transparent"}>Run again</button>
+    </div>
+  );
+}
+
+// ─── Shuffle helper ───
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+const PRACTICE_DURATION = 60000;
+const CONDITION_PRACTICE_DURATION = 15000;
+const PRACTICE_CONDITION = { id: "practice", label: "Practice", color: "#5EEAD4", secondary: null };
+
+// ─── Main ───
+function App() {
+  const [screen, setScreen] = useState("intro");
+  const [condIdx, setCondIdx] = useState(0);
+  const [data, setData] = useState({});
+  const [trialOrder, setTrialOrder] = useState(CONDITIONS);
+
+  const startPractice = () => { setScreen("practice-briefing"); };
+
+  const handlePracticeDone = () => {
+    const randomized = shuffle(CONDITIONS);
+    setTrialOrder(randomized);
+    setCondIdx(0);
+    setData({});
+    setScreen("practice-done");
+  };
+
+  const startExperiment = () => {
+    setCondIdx(0);
+    setScreen("briefing");
+  };
+
+  const handleCondPracticeDone = () => {
+    setScreen("pre-real");
+  };
+
+  const handleDone = (result) => {
+    const c = trialOrder[condIdx];
+    setData(prev => ({ ...prev, [c.id]: result }));
+    setScreen("tlx");
+  };
+
+  const handleTLX = (ratings) => {
+    const c = trialOrder[condIdx];
+    setData(prev => ({ ...prev, [c.id]: { ...prev[c.id], tlx: ratings } }));
+    if (condIdx + 1 < trialOrder.length) { setCondIdx(condIdx + 1); setScreen("briefing"); }
+    else setScreen("results");
+  };
+
+  const restart = () => {
+    setData({});
+    setCondIdx(0);
+    setScreen("intro");
+  };
+
+  return (
+    <div style={{fontFamily:font,color:"#E4E2EE",background:"#080C12",minHeight:"100vh",
+      display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:16}}>
+      <link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+      <style>{`*{box-sizing:border-box}button:active{transform:scale(0.97)}button:focus{outline:none}`}</style>
+
+      {screen==="intro"&&(
+        <div style={{textAlign:"center",maxWidth:720,padding:"32px 0"}}>
+          <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.2em",color:"#5EEAD488",textTransform:"uppercase",marginBottom:10}}>
+            Wickens MRT · Cockpit dual-task</div>
+          <div style={{fontSize:26,fontWeight:700,color:"#5EEAD4",letterSpacing:"-0.02em",marginBottom:6}}>
+            Pilot workload experiment</div>
+          <div style={{width:60,height:2,background:"linear-gradient(90deg,transparent,#5EEAD4,transparent)",margin:"14px auto 20px"}}/>
+          <div style={{fontSize:14,color:"#7E7C92",lineHeight:1.8,marginBottom:16}}>
+            Fly 4 trials of {DURATION/1000} seconds. Primary task: keep your aircraft on the flight director.
+            Each trial adds a cockpit alert telling you to launch your weapons or deploy a flare.
+          </div>
+          <div style={{fontSize:14,color:"#7E7C92",lineHeight:1.8,marginBottom:16}}>
+            The decision is always the same: <span style={{color:"#E4E2EE",fontWeight:600}}>left-click = missile</span>,{" "}
+            <span style={{color:"#E4E2EE",fontWeight:600}}>right-click = flare</span>.
+            Only <em>how</em> the alert reaches you changes — through different combinations of
+            sensory modality (visual vs auditory) and information coding (spatial vs verbal).
+          </div>
+          <div style={{fontSize:14,color:"#7E7C92",lineHeight:1.8,marginBottom:16}}>
+            First you'll do a <span style={{color:"#5EEAD4",fontWeight:600}}>{PRACTICE_DURATION/1000}-second practice flight</span> to
+            get comfortable with the tracking controls. Before each real trial, you'll also get a
+            short {CONDITION_PRACTICE_DURATION/1000}-second practice with that condition's alert type.
+          </div>
+          <div style={{fontSize:13,color:"#F472B688",marginBottom:24}}>Headphones required for auditory conditions</div>
+          <button onClick={startPractice} style={btnStyle()}
+            onMouseEnter={e=>{e.target.style.background="#5EEAD411";e.target.style.borderColor="#5EEAD488";}}
+            onMouseLeave={e=>{e.target.style.background="transparent";e.target.style.borderColor="#5EEAD444";}}
+          >Begin</button>
+        </div>
+      )}
+
+      {screen==="practice-briefing"&&(
+        <div style={{maxWidth:720,padding:"24px 0",textAlign:"center"}}>
+          <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.12em",color:"#FBBF24",textTransform:"uppercase",marginBottom:8}}>
+            Practice flight</div>
+          <div style={{fontSize:22,fontWeight:700,color:"#5EEAD4",marginBottom:16}}>Learn the controls</div>
+          <div style={{background:"#141419",border:"1px solid #27272F",borderRadius:10,padding:16,marginBottom:16,lineHeight:1.7,textAlign:"left"}}>
+            <div style={{fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",color:"#5EEAD4",fontWeight:600,marginBottom:8}}>
+              How to fly</div>
+            <div style={{fontSize:13,color:"#7E7C92"}}>
+              Your mouse is a <span style={{color:"#E4E2EE",fontWeight:600}}>flight stick</span>.
+              Move it away from the center of the display to steer — the further from center,
+              the faster the <span style={{color:"#E4E2EE",fontWeight:600}}>white aircraft wings</span> move.
+              Keep them aligned with the <span style={{color:"#FBBF24",fontWeight:600}}>gold flight director (V shape)</span>.
+            </div>
+            <div style={{fontSize:13,color:"#7E7C92",marginTop:10}}>
+              Mouse at center = no input. Mouse off-screen = auto-centers.
+              Your tracking error (deviation in pixels) is shown at the bottom of the HUD.
+            </div>
+          </div>
+          <div style={{fontSize:13,color:"#7E7C92",marginBottom:20}}>
+            This practice is {PRACTICE_DURATION/1000} seconds — just tracking, no alerts. Score is not recorded.
+          </div>
+          <button onClick={()=>setScreen("practice-trial")} style={btnStyle()}
+            onMouseEnter={e=>e.target.style.background="#5EEAD411"}
+            onMouseLeave={e=>e.target.style.background="transparent"}
+          >Start practice flight</button>
+        </div>
+      )}
+
+      {screen==="practice-trial"&&(
+        <Trial
+          key="practice"
+          condition={PRACTICE_CONDITION}
+          onDone={handlePracticeDone}
+          duration={PRACTICE_DURATION}
+          isPractice
+        />
+      )}
+
+      {screen==="practice-done"&&(
+        <div style={{textAlign:"center",maxWidth:720,padding:"40px 0"}}>
+          <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.15em",color:"#5EEAD488",textTransform:"uppercase",marginBottom:10}}>
+            Practice complete</div>
+          <div style={{fontSize:22,fontWeight:700,color:"#5EEAD4",marginBottom:12}}>
+            Ready for the experiment</div>
+          <div style={{fontSize:14,color:"#7E7C92",lineHeight:1.8,marginBottom:12}}>
+            Now you'll fly 4 real trials of {DURATION/1000} seconds each. Before each trial you'll get
+            a briefing and a short {CONDITION_PRACTICE_DURATION/1000}-second practice with that alert type.
+            The order has been <span style={{color:"#E4E2EE",fontWeight:600}}>randomized</span> for this session.
+          </div>
+          <div style={{fontSize:13,color:"#7E7C92",marginBottom:8}}>
+            Trial order:
+          </div>
+          <div style={{background:"#141419",border:"1px solid #27272F",borderRadius:10,padding:14,marginBottom:24,textAlign:"left"}}>
+            {trialOrder.map((c,i)=>(
+              <div key={c.id} style={{display:"flex",gap:8,marginBottom:i<trialOrder.length-1?6:0,alignItems:"baseline"}}>
+                <span style={{color:c.color,fontWeight:700,minWidth:16,fontFamily:font,fontSize:13}}>{i+1}.</span>
+                <span style={{color:c.color,fontWeight:600,fontSize:13}}>{c.label}</span>
+              </div>
+            ))}
+          </div>
+          <button onClick={startExperiment} style={btnStyle()}
+            onMouseEnter={e=>e.target.style.background="#5EEAD411"}
+            onMouseLeave={e=>e.target.style.background="transparent"}
+          >Start experiment</button>
+        </div>
+      )}
+
+      {screen==="briefing"&&(
+        <Briefing condition={trialOrder[condIdx]} condIdx={condIdx} total={trialOrder.length} onReady={()=>setScreen("cond-practice")}/>
+      )}
+
+      {screen==="cond-practice"&&(
+        <Trial
+          key={`cp-${trialOrder[condIdx].id}`}
+          condition={trialOrder[condIdx]}
+          onDone={handleCondPracticeDone}
+          duration={CONDITION_PRACTICE_DURATION}
+          isPractice
+        />
+      )}
+
+      {screen==="pre-real"&&(
+        <div style={{textAlign:"center",padding:"48px 0"}}>
+          <div style={{fontSize:13,color:"#7E7C92",marginBottom:6}}>Practice done — now the real trial</div>
+          <div style={{fontSize:20,fontWeight:700,color:trialOrder[condIdx].color,marginBottom:8}}>
+            {trialOrder[condIdx].label}
+          </div>
+          <div style={{fontSize:14,color:"#7E7C92",marginBottom:24}}>
+            This one counts. {DURATION/1000} seconds. Same alert type you just practiced.
+          </div>
+          <button onClick={()=>setScreen("trial")} style={btnStyle(trialOrder[condIdx].color)}
+            onMouseEnter={e=>e.target.style.background=`${trialOrder[condIdx].color}11`}
+            onMouseLeave={e=>e.target.style.background="transparent"}
+          >Start real trial</button>
+        </div>
+      )}
+
+      {screen==="trial"&&(
+        <Trial key={trialOrder[condIdx].id} condition={trialOrder[condIdx]} onDone={handleDone}/>
+      )}
+
+      {screen==="tlx"&&(
+        <NasaTLX condition={trialOrder[condIdx]} onSubmit={handleTLX}/>
+      )}
+
+      {screen==="results"&&<Results data={data} onRestart={restart}/>}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
